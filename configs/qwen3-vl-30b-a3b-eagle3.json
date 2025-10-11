@@ -26,8 +26,7 @@
       24,
       20,
       20
-    ],
-    "rope_type": "default"
+    ]
   },
   "rope_theta": 5000000,
   "sliding_window": null,
@@ -39,4 +38,3 @@
   "vocab_size": 151936,
   "draft_vocab_size": 32000
 }
-

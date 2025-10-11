@@ -563,21 +563,26 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             past_key_values_length = past_key_values[0][0].shape[2]
             seq_length_with_past = seq_length_with_past + past_key_values_length
 
-        if position_ids is None:
-            attention_mask_tensor = (
-                attention_mask
-                if not isinstance(attention_mask, dict)
-                else attention_mask["full_attention"]
+        base_attention_mask = (
+            attention_mask
+            if not isinstance(attention_mask, dict)
+            else attention_mask["full_attention"]
+        )
+        if base_attention_mask is not None and base_attention_mask.ndim == 4:
+            base_attention_mask = torch.diagonal(
+                base_attention_mask[:, 0], dim1=1, dim2=2
             )
-            if attention_mask_tensor is not None and attention_mask_tensor.ndim == 4:
-                attention_mask_tensor = torch.diagonal(
-                    attention_mask_tensor[:, 0], dim1=1, dim2=2
+            if base_attention_mask.dtype.is_floating_point:
+                base_attention_mask = (
+                    base_attention_mask
+                    / torch.finfo(base_attention_mask.dtype).min
                 )
-                attention_mask_tensor = (
-                    attention_mask_tensor / torch.finfo(attention_mask_tensor.dtype).min
-                )
-                attention_mask_tensor = (1.0 - attention_mask_tensor).int()
+                base_attention_mask = (1.0 - base_attention_mask).int()
+            else:
+                base_attention_mask = base_attention_mask.int()
 
+        if position_ids is None:
+            attention_mask_tensor = base_attention_mask
             position_ids, rope_deltas = self.target_model.model.get_rope_index(
                 input_ids,
                 image_grid_thw,
@@ -586,8 +591,18 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 attention_mask=attention_mask_tensor,
             )
             self.rope_deltas = rope_deltas
+            full_attention_mask = (
+                attention_mask_tensor.clone()
+                if attention_mask_tensor is not None
+                else None
+            )
         else:
             position_ids = position_ids
+            full_attention_mask = (
+                base_attention_mask.clone()
+                if base_attention_mask is not None
+                else None
+            )
 
         # Step 4: handle attention mask
         if attention_mask is None:
@@ -598,7 +613,7 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
             )
         if self.attention_backend == "sdpa":
             attention_mask = self.draft_model.prepare_decoder_attention_mask(
-                attention_mask=attention_mask,
+                attention_mask=full_attention_mask,
                 hidden_states=hidden_states,
                 batch_size=batch_size,
                 seq_length=seq_length,
@@ -662,13 +677,32 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                 input_ids = padding(input_ids, left=False)
                 position_mask = padding(position_mask, left=False)
                 loss_mask = padding(loss_mask, left=False)
+                if full_attention_mask is not None:
+                    full_attention_mask = padding(full_attention_mask, left=False)
                 if self.attention_backend == "sdpa":
-                    ind = torch.arange(seq_length, device=attention_mask.device)
-                    ind0 = ind[idx:]
-                    ind1 = ind[: seq_length - idx]
-                    attention_mask[:, :, ind0, ind1] = torch.finfo(
-                        attention_mask.dtype
-                    ).min
+                    attention_mask = self.draft_model.prepare_decoder_attention_mask(
+                        attention_mask=full_attention_mask,
+                        hidden_states=hidden_states,
+                        batch_size=batch_size,
+                        seq_length=seq_length,
+                        past_key_values_length=past_key_values_length,
+                    )
+                else:
+                    if attention_mask is not None:
+                        attention_mask = padding(attention_mask, left=False)
+
+                # recompute position ids / rope deltas for updated inputs
+                attention_mask_tensor = (
+                    full_attention_mask if full_attention_mask is not None else None
+                )
+                position_ids, rope_deltas = self.target_model.model.get_rope_index(
+                    input_ids,
+                    image_grid_thw,
+                    None,
+                    second_per_grid_ts=None,
+                    attention_mask=attention_mask_tensor,
+                )
+                self.rope_deltas = rope_deltas
                 # Flex attention mask shirnking is handled inside attention module
         return plosses, vlosses, acces
 

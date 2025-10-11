@@ -234,6 +234,17 @@ def main():
         # Use provided config file
         draft_model_config = AutoDraftModelConfig.from_file(args.draft_model_config)
 
+    # safeguard for qwen3_vl_moe because embedding key is different
+    if draft_model_config.target_model_type in ["qwen2_5_vl", "qwen3_vl_moe"]:
+        args.is_vlm = True
+        if draft_model_config.target_model_type == "qwen3_vl_moe":
+            expected_key = "model.language_model.embed_tokens.weight"
+            if args.embedding_key != expected_key:
+                print_on_rank0(
+                    f"WARNING: overriding embedding key from {args.embedding_key} to {expected_key} for qwen3_vl_moe target."
+                )
+                args.embedding_key = expected_key
+
     # detecting last ckpt for draft model
     draft_model_last_checkpoint = None
     if args.resume and os.path.isdir(args.output_dir):

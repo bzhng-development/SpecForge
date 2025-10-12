@@ -21,13 +21,14 @@
   "rms_norm_eps": 1e-06,
   "pretraining_tp": 1,
   "rope_scaling": {
-    "mrope_interleaved": true,
+    "rope_type": "mrope",
     "mrope_section": [
       24,
       20,
       20
     ]
   },
+  "mrope_interleaved": true,
   "rope_theta": 5000000,
   "sliding_window": null,
   "tie_word_embeddings": false,

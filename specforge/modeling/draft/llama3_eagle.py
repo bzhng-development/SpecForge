@@ -301,10 +301,12 @@ class LlamaMutiRotaryEmbedding(LlamaRotaryEmbedding):
         self.mrope_section = (
             [int(x) for x in mrope_section] if mrope_section is not None else None
         )
-        self.interleaved = interleaved and mrope_section is not None
+        self.interleaved = interleaved and self.mrope_section is not None
 
     def _apply_interleaved_mrope(self, freqs: torch.Tensor) -> torch.Tensor:
         """Replicates Qwen3-VL interleaved MRope layout."""
+        if self.mrope_section is None:
+            raise ValueError("mrope_section must be provided when using interleaved MRoPE.")
         # freqs: (3, batch, seq, head_dim // 2)
         freqs_t = freqs[0].clone()
         for dim, offset in enumerate((1, 2), start=1):
@@ -395,7 +397,9 @@ class LlamaAttention(nn.Module):
         scaling_type = rope_get("rope_type", rope_get("type", "default"))
         scaling_factor = rope_get("factor", 1.0)
         mrope_section = rope_get("mrope_section", None)
-        mrope_interleaved = bool(rope_get("mrope_interleaved", False))
+        mrope_interleaved = bool(
+            getattr(self.config, "mrope_interleaved", rope_get("mrope_interleaved", False))
+        )
 
         if mrope_section is not None:
             self.rotary_emb = LlamaMutiRotaryEmbedding(

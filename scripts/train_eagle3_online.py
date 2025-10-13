@@ -340,6 +340,10 @@ def main():
             min_pixels=args.min_pixels,
             max_pixels=args.max_pixels,
         )
+        if args.build_dataset_num_proc > 0:
+            print_on_rank0(
+                "WARNING: VLM dataset preprocessing may hang with --build-dataset-num-proc > 0"
+            )
     else:
         processor = None
 

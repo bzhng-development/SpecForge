@@ -317,7 +317,9 @@ class LlamaMutiRotaryEmbedding(LlamaRotaryEmbedding):
 
     def forward(self, x, position_ids):
         # In contrast to other models, Qwen-VL variants have different position ids for the grids
-        # So we expand the inv_freq to shape (3, ...)
+        # So we expand the position ids/inv_freq to shape (3, ...)
+        if position_ids.ndim == 2:
+            position_ids = position_ids[None, ...].expand(3, -1, -1)
         inv_freq_expanded = (
             self.inv_freq[None, None, :, None]
             .float()

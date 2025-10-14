@@ -399,9 +399,7 @@ class LlamaAttention(nn.Module):
         scaling_type = rope_get("rope_type", rope_get("type", "default"))
         scaling_factor = rope_get("factor", 1.0)
         mrope_section = rope_get("mrope_section", None)
-        mrope_interleaved = bool(
-            getattr(self.config, "mrope_interleaved", rope_get("mrope_interleaved", False))
-        )
+        mrope_interleaved = bool(rope_get("mrope_interleaved", False))
 
         if mrope_section is not None:
             self.rotary_emb = LlamaMutiRotaryEmbedding(

@@ -679,9 +679,8 @@ class QwenVLOnlineEagle3Model(Eagle3Model):
                         seq_length=seq_length,
                         past_key_values_length=past_key_values_length,
                     )
-                else:
-                    if attention_mask is not None:
-                        attention_mask = padding(attention_mask, left=False)
+                elif attention_mask is not None:
+                    attention_mask = padding(attention_mask, left=False)
 
                 # recompute position ids / rope deltas for updated inputs
                 attention_mask_tensor = (

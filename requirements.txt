@@ -14,3 +14,4 @@ pandas
 accelerate
 pydantic
 openai-harmony
+aiohttp

@@ -4,6 +4,7 @@ which better aligns the draft model with the target model's output distribution.
 """
 
 import argparse
+import asyncio
 import json
 import os
 import signal
@@ -15,8 +16,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
+import aiohttp
 import pandas as pd
-import requests
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
@@ -118,7 +119,7 @@ def launch_sglang_server(
     return process
 
 
-def wait_for_server_ready(port: int, timeout: int = 3600) -> bool:
+async def wait_for_server_ready(port: int, timeout: int = 3600) -> bool:
     """Wait for server to be ready"""
     print(f"Waiting for server to be ready at localhost:{port}...")
     start_time = time.time()
@@ -127,13 +128,14 @@ def wait_for_server_ready(port: int, timeout: int = 3600) -> bool:
         if is_port_in_use(int(port)):
             # Port is in use, try to make a simple request
             try:
-                response = requests.get(f"http://localhost:{port}/health", timeout=5)
-                if response.status_code == 200:
-                    print("Server is ready!")
-                    return True
-            except requests.exceptions.RequestException:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(f"http://localhost:{port}/health", timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        if resp.status == 200:
+                            print("Server is ready!")
+                            return True
+            except (aiohttp.ClientError, asyncio.TimeoutError):
                 pass
-        time.sleep(5)
+        await asyncio.sleep(5)
 
     print(f"Server failed to start within {timeout} seconds")
     return False
@@ -159,32 +161,40 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 
-def call_sglang_batch(
+async def call_sglang_single(
+    session: aiohttp.ClientSession,
+    messages: List[Dict[str, Any]]
+) -> str:
+    """Send a single message list to sglang /v1/chat/completions."""
+    global MODEL, MAX_TOKENS, TEMPERATURE, BASE_URL
+    
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "max_tokens": MAX_TOKENS,
+        "temperature": TEMPERATURE,
+    }
+    
+    async with session.post(BASE_URL, json=payload, timeout=aiohttp.ClientTimeout(total=600)) as resp:
+        if resp.status != 200:
+            text = await resp.text()
+            print(f"Error response from server: {text}")
+            print(f"Request payload: {payload}")
+            resp.raise_for_status()
+        
+        data = await resp.json()
+        content = data["choices"][0]["message"]["content"]
+        return content.strip()
+
+
+async def call_sglang_batch(
     messages_list: List[List[Dict[str, Any]]]
 ) -> List[str]:
-    """Send a batch of message lists to sglang /v1/chat/completions for vision models."""
-    global MODEL, MAX_TOKENS, TEMPERATURE, BASE_URL, HEADERS
-
-    # For vision models, we send each conversation separately
-    # sglang's batch endpoint for chat/completions accepts list of message lists
-    results = []
-    for messages in messages_list:
-        payload = {
-            "model": MODEL,
-            "messages": messages,
-            "max_tokens": MAX_TOKENS,
-            "temperature": TEMPERATURE,
-        }
-        resp = requests.post(BASE_URL, headers=HEADERS, json=payload, timeout=600)
-        if resp.status_code != 200:
-            print(f"Error response from server: {resp.text}")
-            print(f"Request payload: {payload}")
-        resp.raise_for_status()
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-        results.append(content.strip())
-    
-    return results
+    """Send a batch of message lists concurrently to sglang /v1/chat/completions."""
+    async with aiohttp.ClientSession() as session:
+        tasks = [call_sglang_single(session, messages) for messages in messages_list]
+        results = await asyncio.gather(*tasks)
+        return results
 
 
 def get_resume_state_path(parquet_path: str) -> Path:
@@ -284,7 +294,7 @@ def write_records_to_parquet(
     )
 
 
-def main():
+async def main():
     global MODEL, MAX_TOKENS, BATCH_SIZE, TEMPERATURE, BASE_URL, SERVER_PROCESS
 
     # Parse command line arguments
@@ -325,7 +335,7 @@ def main():
                 )
 
                 # Wait for server to be ready
-                if not wait_for_server_ready(port):
+                if not await wait_for_server_ready(port):
                     cleanup_server()
                     raise RuntimeError("Failed to start server")
 
@@ -425,7 +435,7 @@ def main():
                 batch_line_indices.append(line_index)
 
                 if len(batch_messages) == BATCH_SIZE:
-                    outputs = call_sglang_batch(batch_messages)
+                    outputs = await call_sglang_batch(batch_messages)
                     rows = build_rows_for_parquet(
                         batch_data, outputs, batch_line_indices
                     )
@@ -448,7 +458,7 @@ def main():
                     batch_line_indices = []
 
             if batch_messages:
-                outputs = call_sglang_batch(batch_messages)
+                outputs = await call_sglang_batch(batch_messages)
                 rows = build_rows_for_parquet(batch_data, outputs, batch_line_indices)
                 pending_rows.extend(rows)
 
@@ -475,4 +485,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

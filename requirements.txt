@@ -2,7 +2,6 @@ pre-commit
 torch==2.8.0
 torchaudio==2.8.0
 torchvision==0.23.0
-transformers==4.57.0
 qwen-vl-utils==0.0.11
 datasets
 setuptools
@@ -10,6 +9,7 @@ tqdm
 wandb
 psutil
 numpy
+pandas
 accelerate
 pydantic
 sglang[all]==0.5.3.post1

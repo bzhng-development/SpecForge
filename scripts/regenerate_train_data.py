@@ -1,17 +1,21 @@
-﻿"""
+"""
 This script will re-generate the dataset from target model,
-which better aligns the draft model with the target model’s output distribution.
+which better aligns the draft model with the target model's output distribution.
 """
 
 import argparse
 import json
+import os
 import signal
 import socket
 import subprocess
 import sys
 import time
-from typing import List
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List
 
+import pandas as pd
 import requests
 from tqdm import tqdm
 from transformers import AutoTokenizer
@@ -24,6 +28,19 @@ TEMPERATURE = None
 BASE_URL = None
 HEADERS = {"Content-Type": "application/json"}
 SERVER_PROCESS = None
+
+PARQUET_WRITE_BATCH_SIZE = 64
+PARQUET_COMPRESSION = "snappy"
+STATE_FILE_SUFFIX = ".state.json"
+PARQUET_COLUMNS = [
+    "input_line_index",
+    "sample_id",
+    "model_name",
+    "max_tokens",
+    "temperature",
+    "processed_timestamp",
+    "conversations_json",
+]
 
 
 def parse_arguments():
@@ -87,7 +104,7 @@ def launch_sglang_server(
         str(port),
     ]
 
-    print(f"Launching sglang server with command:")
+    print("Launching sglang server with command:")
     print(" ".join(cmd))
 
     # Start the server process
@@ -154,6 +171,103 @@ def call_sglang_batch(prompts: List[str]) -> List[str]:
     return [choice["text"].strip() for choice in data["choices"]]
 
 
+def get_resume_state_path(parquet_path: str) -> Path:
+    """Return the path where resume state is persisted."""
+    return Path(f"{parquet_path}{STATE_FILE_SUFFIX}")
+
+
+def load_resume_state(state_path: Path, input_file: str) -> int:
+    """Load the number of lines already processed for the provided input file."""
+    if not state_path.exists():
+        return 0
+    try:
+        with state_path.open("r", encoding="utf-8") as state_file:
+            state = json.load(state_file)
+    except (json.JSONDecodeError, OSError) as exc:
+        print(
+            f"Warning: failed to read resume state from {state_path}. "
+            f"Starting from beginning. Error: {exc}"
+        )
+        return 0
+
+    if state.get("input_file") != input_file:
+        print(
+            f"Warning: resume state {state_path} was created for "
+            f"{state.get('input_file')}, not {input_file}. Ignoring it."
+        )
+        return 0
+
+    processed_count = state.get("processed_line_count")
+    if not isinstance(processed_count, int) or processed_count < 0:
+        print(
+            f"Warning: resume state {state_path} is missing a valid processed_line_count."
+        )
+        return 0
+    return processed_count
+
+
+def save_resume_state(state_path: Path, processed_count: int, input_file: str) -> None:
+    """Persist the processed line count so execution can resume later."""
+    temp_path = state_path.with_suffix(f"{state_path.suffix}.tmp")
+    state_payload = {
+        "processed_line_count": processed_count,
+        "input_file": input_file,
+        "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    with temp_path.open("w", encoding="utf-8") as temp_file:
+        json.dump(state_payload, temp_file)
+    os.replace(temp_path, state_path)
+
+
+def build_rows_for_parquet(
+    batch_data: List[Dict[str, Any]],
+    outputs: List[str],
+    line_indices: List[int],
+) -> List[Dict[str, Any]]:
+    """Construct the row payload that will be written to Parquet."""
+    timestamp = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    rows: List[Dict[str, Any]] = []
+    for record, completion, line_id in zip(batch_data, outputs, line_indices):
+        assistant_message = {"role": "assistant", "content": completion}
+        record["conversations"].append(assistant_message)
+        conversations_json = json.dumps(record["conversations"], ensure_ascii=False)
+
+        rows.append(
+            {
+                "input_line_index": line_id,
+                "sample_id": record.get("id"),
+                "model_name": MODEL,
+                "max_tokens": MAX_TOKENS,
+                "temperature": TEMPERATURE,
+                "processed_timestamp": timestamp,
+                "conversations_json": conversations_json,
+            }
+        )
+    return rows
+
+
+def write_records_to_parquet(
+    records: List[Dict[str, Any]],
+    parquet_path: Path,
+    append: bool,
+) -> None:
+    """Write the provided records to the Parquet sink."""
+    if not records:
+        return
+    df = pd.DataFrame.from_records(records, columns=PARQUET_COLUMNS)
+    df["input_line_index"] = df["input_line_index"].astype("int64")
+    df["max_tokens"] = df["max_tokens"].astype("int64")
+    df["temperature"] = df["temperature"].astype("float64")
+
+    df.to_parquet(
+        parquet_path,
+        engine="pyarrow",
+        compression=PARQUET_COMPRESSION,
+        index=False,
+        append=append,
+    )
+
+
 def main():
     global MODEL, MAX_TOKENS, BATCH_SIZE, TEMPERATURE, BASE_URL, SERVER_PROCESS
 
@@ -168,6 +282,9 @@ def main():
     BASE_URL = f"http://localhost:{args.port}/v1/completions"
     input_file_path = args.input_file_path
     output_file_path = args.output_file_path
+
+    parquet_path = Path(output_file_path)
+    resume_state_path = get_resume_state_path(output_file_path)
 
     # Validate parameters
     if not (0.0 <= TEMPERATURE <= 1.0):
@@ -213,120 +330,121 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    print(f"Configuration:")
+    print("Configuration:")
     print(f"  Model path: {MODEL}")
     print(f"  Max tokens: {MAX_TOKENS}")
     print(f"  Batch size: {BATCH_SIZE}")
     print(f"  Temperature: {TEMPERATURE}")
     print(f"  API URL: {BASE_URL}")
     print(f"  Input file: {input_file_path}")
-    print(f"  Output file: {output_file_path}")
+    print(f"  Output Parquet: {output_file_path}")
     print("-" * 50)
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
 
-    # Variables for batch processing
-    batch_prompts = []
-    batch_data = []
-
-    # Count total lines for progress bar
     print("Counting total lines in file...")
-    with open(input_file_path, "r") as f:
+    with open(input_file_path, "r", encoding="utf-8") as f:
         total_lines = sum(1 for _ in f)
-    total_lines = (
+    target_total = (
         min(args.num_samples, total_lines) if args.num_samples else total_lines
     )
-    print(f"Total {total_lines} lines to process")
 
-    # Create progress bar
-    pbar = tqdm(total=total_lines, desc="Processing", unit="item")
+    resume_offset = load_resume_state(resume_state_path, input_file_path)
+    if resume_offset:
+        print(f"Resuming from input line offset {resume_offset}")
 
-    processed_count = 0
+    if resume_offset >= target_total:
+        print(
+            "Nothing to process: existing resume offset is greater than or equal to "
+            "requested processing limit."
+        )
+        cleanup_server()
+        return
+
+    remaining_to_process = target_total - resume_offset
+    print(
+        f"Total {remaining_to_process} lines to process in this run (of {target_total})"
+    )
+
+    pbar = tqdm(total=remaining_to_process, desc="Processing", unit="item")
+
+    processed_total = resume_offset
+    processed_this_run = 0
+    parquet_append = parquet_path.exists()
+    pending_rows: List[Dict[str, Any]] = []
 
     try:
-        with open(input_file_path, "r") as input_file, open(
-            output_file_path, "w"
-        ) as output_file_handle:
+        with open(input_file_path, "r", encoding="utf-8") as input_file:
+            batch_prompts: List[str] = []
+            batch_data: List[Dict[str, Any]] = []
+            batch_line_indices: List[int] = []
 
-            for _, line in zip(range(total_lines), input_file):
+            for line_index, line in enumerate(input_file):
+                if line_index < resume_offset:
+                    continue
+                if line_index >= target_total:
+                    break
+
                 data = json.loads(line)
                 messages = data["conversations"]
 
-                # Remove original last assistant message
-                if messages[-1]["role"] == "assistant":
+                if messages and messages[-1]["role"] == "assistant":
                     messages.pop()
                 prompt = tokenizer.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=True
                 )
 
-                # Add to batch
                 batch_prompts.append(prompt)
                 batch_data.append(data)
+                batch_line_indices.append(line_index)
 
-                # Process when batch reaches specified size
                 if len(batch_prompts) == BATCH_SIZE:
-                    # Generate outputs
                     outputs = call_sglang_batch(batch_prompts)
+                    rows = build_rows_for_parquet(
+                        batch_data, outputs, batch_line_indices
+                    )
+                    pending_rows.extend(rows)
 
-                    # Process each output
-                    for i, output in enumerate(outputs):
-                        # Create assistant message
-                        assistant_message = {"role": "assistant", "content": output}
-
-                        # Add assistant message to original conversations
-                        batch_data[i]["conversations"].append(assistant_message)
-
-                        # Write to output file
-                        output_file_handle.write(
-                            json.dumps(batch_data[i], ensure_ascii=False) + "\n"
+                    while len(pending_rows) >= PARQUET_WRITE_BATCH_SIZE:
+                        chunk = pending_rows[:PARQUET_WRITE_BATCH_SIZE]
+                        write_records_to_parquet(chunk, parquet_path, parquet_append)
+                        parquet_append = True
+                        pending_rows = pending_rows[PARQUET_WRITE_BATCH_SIZE:]
+                        processed_total += PARQUET_WRITE_BATCH_SIZE
+                        processed_this_run += PARQUET_WRITE_BATCH_SIZE
+                        pbar.update(PARQUET_WRITE_BATCH_SIZE)
+                        save_resume_state(
+                            resume_state_path, processed_total, input_file_path
                         )
 
-                        processed_count += 1
-                        pbar.update(1)
-
-                    # Update progress bar description
-                    pbar.set_postfix(
-                        {
-                            "Processed": processed_count,
-                            "Current batch": len(batch_prompts),
-                        }
-                    )
-
-                    # Clear batch
                     batch_prompts = []
                     batch_data = []
+                    batch_line_indices = []
 
-            # Process remaining data that doesn't fill a complete batch
             if batch_prompts:
                 outputs = call_sglang_batch(batch_prompts)
+                rows = build_rows_for_parquet(batch_data, outputs, batch_line_indices)
+                pending_rows.extend(rows)
 
-                # Process each output
-                for i, output in enumerate(outputs):
-                    assistant_message = {"role": "assistant", "content": output}
+            if pending_rows:
+                write_records_to_parquet(pending_rows, parquet_path, parquet_append)
+                processed_total += len(pending_rows)
+                processed_this_run += len(pending_rows)
+                pbar.update(len(pending_rows))
+                save_resume_state(resume_state_path, processed_total, input_file_path)
 
-                    batch_data[i]["conversations"].append(assistant_message)
-                    output_file_handle.write(
-                        json.dumps(batch_data[i], ensure_ascii=False) + "\n"
-                    )
-
-                    # Update processing count and progress bar
-                    processed_count += 1
-                    pbar.update(1)
-
-                # Update progress bar description
-                pbar.set_postfix(
-                    {"Processed": processed_count, "Last batch": len(batch_prompts)}
-                )
-
-        # Close progress bar
         pbar.close()
-        print(f"\nProcessing completed! Total {processed_count} lines processed")
+        print(
+            f"\nProcessing completed! Total {processed_this_run} new lines processed "
+            f"(cumulative processed lines: {processed_total})"
+        )
 
     except Exception as e:
         print(f"Error during processing: {e}")
         raise
     finally:
-        # Clean up server if we launched it
+        if not pbar.disable:
+            pbar.close()
         cleanup_server()
 
 

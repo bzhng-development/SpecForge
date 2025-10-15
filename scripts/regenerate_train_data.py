@@ -42,6 +42,12 @@ PARQUET_COLUMNS = [
     "conversations_json",
 ]
 
+# set env vars needed for sglang
+os.environ["CUDA_HOME"] = "/usr/local/cuda-12.6"
+os.environ["PATH"] = os.path.join(os.environ["CUDA_HOME"], "bin") + ":" + os.environ.get("PATH", "")
+os.environ["LD_LIBRARY_PATH"] = os.path.join(os.environ["CUDA_HOME"], "lib64") + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+
+
 
 def parse_arguments():
     """Parse command line arguments"""
@@ -52,8 +58,8 @@ def parse_arguments():
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=4096,
-        help="Maximum number of tokens (default: 4096)",
+        default=8192,
+        help="Maximum number of tokens (default: 8192)",
     )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0)
@@ -153,22 +159,29 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 
-def call_sglang_batch(prompts: List[str]) -> List[str]:
-    """Send a batch of prompts to sglang /v1/completions."""
+def call_sglang_batch(
+    messages_list: List[List[Dict[str, Any]]]
+) -> List[str]:
+    """Send a batch of message lists to sglang /v1/chat/completions for vision models."""
     global MODEL, MAX_TOKENS, TEMPERATURE, BASE_URL, HEADERS
 
-    payload = {
-        "model": MODEL,
-        "prompt": prompts,
-        "max_tokens": MAX_TOKENS,
-        "temperature": TEMPERATURE,
-        "skip_special_tokens": False,
-    }
-
-    resp = requests.post(BASE_URL, headers=HEADERS, json=payload, timeout=600)
-    resp.raise_for_status()
-    data = resp.json()
-    return [choice["text"].strip() for choice in data["choices"]]
+    # For vision models, we send each conversation separately
+    # sglang's batch endpoint for chat/completions accepts list of message lists
+    results = []
+    for messages in messages_list:
+        payload = {
+            "model": MODEL,
+            "messages": messages,
+            "max_tokens": MAX_TOKENS,
+            "temperature": TEMPERATURE,
+        }
+        resp = requests.post(BASE_URL, headers=HEADERS, json=payload, timeout=600)
+        resp.raise_for_status()
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        results.append(content.strip())
+    
+    return results
 
 
 def get_resume_state_path(parquet_path: str) -> Path:
@@ -279,7 +292,7 @@ def main():
     MAX_TOKENS = args.max_tokens
     BATCH_SIZE = args.batch_size
     TEMPERATURE = args.temperature
-    BASE_URL = f"http://localhost:{args.port}/v1/completions"
+    BASE_URL = f"http://localhost:{args.port}/v1/chat/completions"
     input_file_path = args.input_file_path
     output_file_path = args.output_file_path
 
@@ -375,7 +388,7 @@ def main():
 
     try:
         with open(input_file_path, "r", encoding="utf-8") as input_file:
-            batch_prompts: List[str] = []
+            batch_messages: List[List[Dict[str, Any]]] = []
             batch_data: List[Dict[str, Any]] = []
             batch_line_indices: List[int] = []
 
@@ -386,20 +399,29 @@ def main():
                     break
 
                 data = json.loads(line)
-                messages = data["conversations"]
+                messages = data["conversations"].copy()
 
+                # Remove last assistant message if present
                 if messages and messages[-1]["role"] == "assistant":
                     messages.pop()
-                prompt = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True
-                )
+                
+                # For Qwen3-VL: Add <image> token to first user message if image exists
+                if "image" in data and data["image"] and messages:
+                    for msg in messages:
+                        if msg["role"] == "user":
+                            # Prepend <image> token to content
+                            msg["content"] = [
+                                {"type": "image", "image": data["image"]},
+                                {"type": "text", "text": msg["content"]}
+                            ]
+                            break
 
-                batch_prompts.append(prompt)
+                batch_messages.append(messages)
                 batch_data.append(data)
                 batch_line_indices.append(line_index)
 
-                if len(batch_prompts) == BATCH_SIZE:
-                    outputs = call_sglang_batch(batch_prompts)
+                if len(batch_messages) == BATCH_SIZE:
+                    outputs = call_sglang_batch(batch_messages)
                     rows = build_rows_for_parquet(
                         batch_data, outputs, batch_line_indices
                     )
@@ -417,12 +439,12 @@ def main():
                             resume_state_path, processed_total, input_file_path
                         )
 
-                    batch_prompts = []
+                    batch_messages = []
                     batch_data = []
                     batch_line_indices = []
 
-            if batch_prompts:
-                outputs = call_sglang_batch(batch_prompts)
+            if batch_messages:
+                outputs = call_sglang_batch(batch_messages)
                 rows = build_rows_for_parquet(batch_data, outputs, batch_line_indices)
                 pending_rows.extend(rows)
 

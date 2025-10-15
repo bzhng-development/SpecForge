@@ -176,6 +176,9 @@ def call_sglang_batch(
             "temperature": TEMPERATURE,
         }
         resp = requests.post(BASE_URL, headers=HEADERS, json=payload, timeout=600)
+        if resp.status_code != 200:
+            print(f"Error response from server: {resp.text}")
+            print(f"Request payload: {payload}")
         resp.raise_for_status()
         data = resp.json()
         content = data["choices"][0]["message"]["content"]
@@ -405,13 +408,14 @@ def main():
                 if messages and messages[-1]["role"] == "assistant":
                     messages.pop()
                 
-                # For Qwen3-VL: Add <image> token to first user message if image exists
+                # For Qwen3-VL: Add image to first user message if image exists
+                # sglang uses OpenAI API format: type="image_url" with image_url={"url": "..."}
                 if "image" in data and data["image"] and messages:
                     for msg in messages:
                         if msg["role"] == "user":
-                            # Prepend <image> token to content
+                            # Prepend image to content (OpenAI format with absolute path as URL)
                             msg["content"] = [
-                                {"type": "image", "image": data["image"]},
+                                {"type": "image_url", "image_url": {"url": data["image"]}},
                                 {"type": "text", "text": msg["content"]}
                             ]
                             break

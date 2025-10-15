@@ -43,10 +43,7 @@ def parse_arguments():
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--input-file-path", type=str, required=True)
     parser.add_argument("--output-file-path", type=str, required=True)
-    parser.add_argument("--tp-size", type=int, default=8)
-    parser.add_argument("--dp-size", type=int, default=1)
-    parser.add_argument("--mem-fraction-static", type=float, default=0.85)
-    parser.add_argument("--max-running-requests", type=int, default=128)
+    parser.add_argument("--mem-fraction-static", type=float, default=0.8)
     parser.add_argument(
         "--auto-launch-server",
         action="store_true",
@@ -70,34 +67,24 @@ def is_port_in_use(port: int) -> bool:
 def launch_sglang_server(
     model_path: str,
     port: int,
-    tp_size: int,
-    dp_size: int,
     mem_fraction_static: float,
-    max_running_requests: int,
 ) -> subprocess.Popen:
     """Launch sglang server"""
     cmd = [
-        "python3",
+        "python",
         "-m",
         "sglang.launch_server",
-        "--model",
+        "--model-path",
         model_path,
-        "--trust-remote-code",
-        "--tp-size",
-        str(tp_size),
-        "--dp-size",
-        str(dp_size),
-        "--enable-cache-report",
-        "--dtype",
-        "bfloat16",
-        "--log-level",
-        "info",
         "--mem-fraction-static",
         str(mem_fraction_static),
+        "--trust-remote-code",
+        "--cuda-graph-max-bs",
+        "768",
+        "--model-loader-extra-config",
+        '{"enable_multithread_load": true, "num_threads": 8}',
         "--port",
         str(port),
-        "--max-running-requests",
-        str(max_running_requests),
     ]
 
     print(f"Launching sglang server with command:")
@@ -201,10 +188,7 @@ def main():
                 SERVER_PROCESS = launch_sglang_server(
                     model_path=args.model,
                     port=port,
-                    tp_size=args.tp_size,
-                    dp_size=args.dp_size,
                     mem_fraction_static=args.mem_fraction_static,
-                    max_running_requests=args.max_running_requests,
                 )
 
                 # Wait for server to be ready
